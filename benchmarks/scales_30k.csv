@@ -1,0 +1,4 @@
+Method,Scale 1,Scale 2,Scale 3,Scale 4,Average
+Octree-GS,30.4862,29.0615,27.7979,25.1930,28.1299
++ Sampling-aware imaging,30.8730,29.3964,28.1445,25.3762,28.4432
+Ours,31.0459,29.5228,28.2114,25.4461,28.5553

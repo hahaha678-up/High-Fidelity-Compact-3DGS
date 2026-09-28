@@ -214,9 +214,13 @@ int CudaRasterizer::Rasterizer::forward(
 	const float* projmatrix,
 	const float* cam_pos,
 	const float tan_fovx, float tan_fovy,
+	const float kernel_size,
+	const float* subpixel_offset,
 	const bool prefiltered,
 	float* out_color,
 	int* radii,
+	float* important_score,
+	int* gaussians_count,
 	bool debug)
 {
 	const float focal_y = height / (2.0f * tan_fovy);
@@ -261,6 +265,7 @@ int CudaRasterizer::Rasterizer::forward(
 		width, height,
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
+		kernel_size,
 		radii,
 		geomState.means2D,
 		geomState.depths,
@@ -324,18 +329,19 @@ int CudaRasterizer::Rasterizer::forward(
 		imgState.ranges,
 		binningState.point_list,
 		width, height,
+		(float2*)subpixel_offset,
 		geomState.means2D,
 		feature_ptr,
 		geomState.conic_opacity,
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		background,
-		out_color
-		), debug)
+		out_color,
+		important_score,
+		gaussians_count), debug)
 
 	return num_rendered;
 }
-
 
 void CudaRasterizer::Rasterizer::visible_filter(
 	std::function<char* (size_t)> geometryBuffer,
@@ -351,6 +357,7 @@ void CudaRasterizer::Rasterizer::visible_filter(
 	const float* viewmatrix,
 	const float* projmatrix,
 	const float tan_fovx, float tan_fovy,
+	const float kernel_size,
 	const bool prefiltered,
 	int* radii,
 	bool debug)
@@ -368,14 +375,10 @@ void CudaRasterizer::Rasterizer::visible_filter(
 	}
 
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
-	// dim3 block(BLOCK_X, BLOCK_Y, 1);
-
-	// Dynamically resize image-based auxiliary buffers during training
 	size_t img_chunk_size = required<ImageState>(width * height);
 	char* img_chunkptr = imageBuffer(img_chunk_size);
 	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
 
-	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
 	CHECK_CUDA(FORWARD::filter_preprocess(
 		P, M,
 		means3D,
@@ -387,14 +390,13 @@ void CudaRasterizer::Rasterizer::visible_filter(
 		width, height,
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
+		kernel_size,
 		radii,
 		geomState.cov3D,
 		tile_grid,
 		prefiltered
 	), debug)
-
 }
-
 
 // Produce necessary gradients for optimization, corresponding
 // to forward render pass
@@ -413,6 +415,8 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* projmatrix,
 	const float* campos,
 	const float tan_fovx, float tan_fovy,
+	const float kernel_size,
+	const float* subpixel_offset,
 	const int* radii,
 	char* geom_buffer,
 	char* binning_buffer,
@@ -454,6 +458,7 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.ranges,
 		binningState.point_list,
 		width, height,
+		(float2*)subpixel_offset,
 		background,
 		geomState.means2D,
 		geomState.conic_opacity,
@@ -483,6 +488,7 @@ void CudaRasterizer::Rasterizer::backward(
 		projmatrix,
 		focal_x, focal_y,
 		tan_fovx, tan_fovy,
+		kernel_size,
 		(glm::vec3*)campos,
 		(float3*)dL_dmean2D,
 		dL_dconic,
@@ -491,5 +497,7 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dcov3D,
 		dL_dsh,
 		(glm::vec3*)dL_dscale,
-		(glm::vec4*)dL_drot), debug)
+		(glm::vec4*)dL_drot,
+		geomState.conic_opacity,
+		dL_dopacity), debug)
 }

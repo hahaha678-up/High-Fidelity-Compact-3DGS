@@ -55,6 +55,7 @@ class ModelParams(ParamGroup):
         self._model_path = ""
         self._images = "images"
         self._resolution = 1
+        self._kernel_size = 0.1
         self.white_background = False
         self.random_background = False
         self.resolution_scales = [1.0]
@@ -100,6 +101,7 @@ class PipelineParams(ParamGroup):
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
         self.iterations = 40_000
+        self.filter_3D_update_interval = 1000
         self.position_lr_init = 0.0
         self.position_lr_final = 0.0
         self.position_lr_delay_mult = 0.01
@@ -160,6 +162,8 @@ class OptimizationParams(ParamGroup):
         self.min_opacity = 0.005
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002
+        self.anchor_contribution_pruning = False
+        self.contribution_reset_interval = 0
 
         super().__init__(parser, "Optimization Parameters")
 

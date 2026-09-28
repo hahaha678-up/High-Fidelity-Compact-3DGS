@@ -22,32 +22,34 @@ def command(data, output, gpu, port):
             '--fork', '2', '--base_layer', '10', '--visible_threshold', '0.0',
             '--dist2level', 'round', '--update_ratio', '0.2', '--progressive',
             '--levels', '-1', '--init_level', '-1', '--dist_ratio', '0.99',
-            '--extra_ratio', '0.25', '--extra_up', '0.01', '--iterations', '40000',
-            '--test_iterations', '40000', '--save_iterations', '40000',
+            '--extra_ratio', '0.25', '--extra_up', '0.01', '--iterations', '30000',
+            '--test_iterations', '30000', '--save_iterations', '30000',
             '--checkpoint_iterations', '999999', '--update_until', '25000',
             '--position_lr_max_steps', '40000', '--offset_lr_max_steps', '40000',
             '--mlp_opacity_lr_max_steps', '40000', '--mlp_cov_lr_max_steps', '40000',
             '--mlp_color_lr_max_steps', '40000', '--mlp_featurebank_lr_max_steps', '40000',
-            '--appearance_lr_max_steps', '40000']
+            '--appearance_lr_max_steps', '40000', '--kernel_size', '0.1',
+            '--filter_3D_update_interval', '1000', '--anchor_contribution_pruning',
+            '--contribution_reset_interval', '10000']
 
 
 def verify(output, expected):
-    for relative in ('results.json', 'per_view.json', 'point_cloud/iteration_40000/point_cloud.ply'):
+    for relative in ('results.json', 'per_view.json', 'point_cloud/iteration_30000/point_cloud.ply'):
         path = output / relative
         if not path.is_file() or path.stat().st_size == 0:
             raise RuntimeError('Missing output: ' + str(path))
-    metrics = json.loads((output / 'results.json').read_text())['ours_40000']
+    metrics = json.loads((output / 'results.json').read_text())['ours_30000']
     if not all(math.isfinite(metrics[key]) for key in ('PSNR', 'SSIM', 'LPIPS')):
         raise RuntimeError('Non-finite final metrics')
     json.loads((output / 'per_view.json').read_text())
     for folder in ('renders', 'gt'):
-        count = sum(p.is_file() for p in (output / 'test/ours_40000' / folder).iterdir())
+        count = sum(p.is_file() for p in (output / 'test/ours_30000' / folder).iterdir())
         if count != expected:
             raise RuntimeError('{}: expected {}, found {}'.format(folder, expected, count))
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Public Octree-GS framework: BungeeNeRF 40K configuration')
+    parser = argparse.ArgumentParser(description='BungeeNeRF 30K reported-result configuration')
     parser.add_argument('--data-root', type=Path, required=True)
     parser.add_argument('--output-root', type=Path, required=True)
     parser.add_argument('--scene', choices=list(SCENES) + ['all'], default='all')

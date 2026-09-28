@@ -37,7 +37,7 @@ from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, show_level, ape_code):
+def render_set(model_path, name, iteration, views, gaussians, pipeline, background, show_level, ape_code, kernel_size):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     makedirs(render_path, exist_ok=True)
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
@@ -54,8 +54,18 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torch.cuda.synchronize(); t0 = time.time()
 
         gaussians.set_anchor_mask(view.camera_center, iteration, view.resolution_scale)
-        voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
-        render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask, ape_code=ape_code)
+        voxel_visible_mask = prefilter_voxel(
+            view, gaussians, pipeline, background, kernel_size=kernel_size
+        )
+        render_pkg = render(
+            view,
+            gaussians,
+            pipeline,
+            background,
+            visible_mask=voxel_visible_mask,
+            ape_code=ape_code,
+            kernel_size=kernel_size,
+        )
         
         torch.cuda.synchronize(); t1 = time.time()
         t_list.append(t1-t0)
@@ -71,8 +81,18 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         if show_level:
             for cur_level in range(gaussians.levels):
                 gaussians.set_anchor_mask_perlevel(view.camera_center, view.resolution_scale, cur_level)
-                voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
-                render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask, ape_code=ape_code)
+                voxel_visible_mask = prefilter_voxel(
+                    view, gaussians, pipeline, background, kernel_size=kernel_size
+                )
+                render_pkg = render(
+                    view,
+                    gaussians,
+                    pipeline,
+                    background,
+                    visible_mask=voxel_visible_mask,
+                    ape_code=ape_code,
+                    kernel_size=kernel_size,
+                )
                 
                 rendering = render_pkg["render"]
                 visible_count = render_pkg["visibility_filter"].sum()
@@ -98,6 +118,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             dataset.visible_threshold, dataset.dist2level, dataset.base_layer, dataset.progressive, dataset.extend
         )
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False, resolution_scales=dataset.resolution_scales)
+        gaussians.compute_3D_filter(scene.getTrainCameras())
         gaussians.eval()
         gaussians.plot_levels()
         if dataset.random_background:
@@ -111,10 +132,10 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             os.makedirs(dataset.model_path)
         
         if not skip_train:
-            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, show_level, ape_code)
+            render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, show_level, ape_code, dataset.kernel_size)
 
         if not skip_test:
-            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, show_level, ape_code)
+            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, show_level, ape_code, dataset.kernel_size)
 
 if __name__ == "__main__":
     # Set up command line argument parser

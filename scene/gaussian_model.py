@@ -96,6 +96,9 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        self.filter_3D = torch.empty(0)
+        self.anchor_contribution_accum = torch.empty(0)
+        self.anchor_contribution_views = torch.empty(0)
         
         self.offset_gradient_accum = torch.empty(0)
         self.offset_denom = torch.empty(0)
@@ -219,6 +222,77 @@ class GaussianModel:
     @property
     def get_anchor_feat(self):
         return self._anchor_feat
+
+    @torch.no_grad()
+    def compute_3D_filter(self, cameras, chunk_size=262144):
+        if self.get_anchor.numel() == 0:
+            raise RuntimeError("Cannot compute filter_3D before anchors are initialized.")
+        if not cameras:
+            raise RuntimeError("Cannot compute filter_3D without training cameras.")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive.")
+
+        device = self.get_anchor.device
+        dtype = self.get_anchor.dtype
+        num_anchors = self.get_anchor.shape[0]
+        num_slots = num_anchors * self.n_offsets
+        distance = torch.full((num_slots,), 100000.0, device=device, dtype=dtype)
+        valid_points = torch.zeros((num_slots,), device=device, dtype=torch.bool)
+
+        camera_params = []
+        focal_length = 0.0
+        for camera in cameras:
+            focal_x = float(camera.image_width) / (2.0 * math.tan(float(camera.FoVx) / 2.0))
+            focal_y = float(camera.image_height) / (2.0 * math.tan(float(camera.FoVy) / 2.0))
+            focal_length = max(focal_length, focal_x)
+            camera_params.append((
+                torch.as_tensor(camera.R, device=device, dtype=dtype),
+                torch.as_tensor(camera.T, device=device, dtype=dtype),
+                focal_x,
+                focal_y,
+                float(camera.image_width),
+                float(camera.image_height),
+            ))
+
+        if focal_length <= 0.0:
+            raise RuntimeError("Training cameras have no valid focal length.")
+
+        anchor_scaling = self.get_scaling[:, :3]
+        for start in range(0, num_slots, chunk_size):
+            end = min(start + chunk_size, num_slots)
+            slot_indices = torch.arange(start, end, device=device)
+            anchor_indices = torch.div(slot_indices, self.n_offsets, rounding_mode="floor")
+            offset_indices = torch.remainder(slot_indices, self.n_offsets)
+            xyz = (
+                self.get_anchor[anchor_indices]
+                + self._offset[anchor_indices, offset_indices] * anchor_scaling[anchor_indices]
+            )
+
+            chunk_distance = distance[start:end]
+            chunk_valid = valid_points[start:end]
+            for rotation, translation, focal_x, focal_y, image_width, image_height in camera_params:
+                xyz_cam = xyz @ rotation + translation.unsqueeze(0)
+                valid_depth = xyz_cam[:, 2] > 0.2
+                z = xyz_cam[:, 2].clamp_min(0.001)
+                x = xyz_cam[:, 0] / z * focal_x + image_width / 2.0
+                y = xyz_cam[:, 1] / z * focal_y + image_height / 2.0
+                in_screen = (
+                    (x >= -0.15 * image_width)
+                    & (x <= 1.15 * image_width)
+                    & (y >= -0.15 * image_height)
+                    & (y <= 1.15 * image_height)
+                )
+                valid = valid_depth & in_screen
+                chunk_distance[valid] = torch.minimum(chunk_distance[valid], z[valid])
+                chunk_valid |= valid
+
+        if not valid_points.any():
+            raise RuntimeError("No Anchor-offset centers are visible when computing filter_3D.")
+
+        distance[~valid_points] = distance[valid_points].max()
+        self.filter_3D = (
+            distance / focal_length * math.sqrt(0.2)
+        ).reshape(num_anchors, self.n_offsets, 1)
     
     @property
     def get_opacity_mlp(self):
@@ -411,6 +485,8 @@ class GaussianModel:
         self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.anchor_contribution_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.anchor_contribution_views = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
         
         l = [
             {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
@@ -652,6 +728,22 @@ class GaussianModel:
         grad_norm = torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.offset_gradient_accum[combined_mask] += grad_norm
         self.offset_denom[combined_mask] += 1
+
+    @torch.no_grad()
+    def accumulate_anchor_contribution(self, anchor_index, important_score, anchor_visible_mask):
+        """Accumulate LightGaussian's per-Gaussian score at the persistent Anchor level."""
+        if anchor_index.numel() != important_score.numel():
+            raise RuntimeError(
+                f"Contribution mapping mismatch: {anchor_index.numel()} ids vs "
+                f"{important_score.numel()} scores"
+            )
+        if anchor_visible_mask.shape[0] != self.get_anchor.shape[0]:
+            raise RuntimeError("Anchor visibility mask does not match current Anchor topology")
+        if anchor_index.numel() > 0:
+            self.anchor_contribution_accum.index_add_(
+                0, anchor_index.reshape(-1), important_score.detach().reshape(-1, 1)
+            )
+        self.anchor_contribution_views[anchor_visible_mask] += 1.0
         
     def _prune_anchor_optimizer(self, mask):
         optimizable_tensors = {}
@@ -700,6 +792,8 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
         self._level = self._level[valid_points_mask]    
         self._extra_level = self._extra_level[valid_points_mask]
+        self.anchor_contribution_accum = self.anchor_contribution_accum[valid_points_mask]
+        self.anchor_contribution_views = self.anchor_contribution_views[valid_points_mask]
     
     def get_remove_duplicates(self, grid_coords, selected_grid_coords_unique, use_chunk = True):
         if use_chunk:
@@ -837,6 +931,17 @@ class GaussianModel:
                 del self.opacity_accum
                 self.opacity_accum = temp_opacity_accum
 
+                temp_contribution = torch.cat([
+                    self.anchor_contribution_accum,
+                    torch.zeros([new_opacities.shape[0], 1], device='cuda').float(),
+                ], dim=0)
+                temp_contribution_views = torch.cat([
+                    self.anchor_contribution_views,
+                    torch.zeros([new_opacities.shape[0], 1], device='cuda').float(),
+                ], dim=0)
+                self.anchor_contribution_accum = temp_contribution
+                self.anchor_contribution_views = temp_contribution_views
+
                 torch.cuda.empty_cache()
                 
                 optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -849,7 +954,7 @@ class GaussianModel:
                 self._level = torch.cat([self._level, new_level], dim=0)
                 self._extra_level = torch.cat([self._extra_level, new_extra_level], dim=0)
 
-    def adjust_anchor(self, iteration, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, update_ratio=0.5, extra_ratio=4.0, extra_up=0.25, min_opacity=0.005):
+    def adjust_anchor(self, iteration, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, update_ratio=0.5, extra_ratio=4.0, extra_up=0.25, min_opacity=0.005, contribution_pruning=False, contribution_reset_interval=0):
         # # adding anchors
         grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
         grads[grads.isnan()] = 0.0
@@ -872,10 +977,59 @@ class GaussianModel:
         self.offset_gradient_accum = torch.cat([self.offset_gradient_accum, padding_offset_gradient_accum], dim=0)
         
         # # prune anchors
-        prune_mask = (self.opacity_accum < min_opacity*self.anchor_demon).squeeze(dim=1)
         anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(dim=1) # [N, 1]
-        prune_mask = torch.logical_and(prune_mask, anchors_mask) # [N] 
+        opacity_prune_mask = (self.opacity_accum < min_opacity*self.anchor_demon).squeeze(dim=1)
+        opacity_prune_mask = torch.logical_and(opacity_prune_mask, anchors_mask)
+
+        if contribution_pruning:
+            # Preserve the baseline's per-window pruning count, but choose identities
+            # by window-normalized multi-view contribution within each LOD.
+            prune_mask = torch.zeros_like(anchors_mask)
+            contribution_views = self.anchor_contribution_views.squeeze(dim=1)
+            if contribution_reset_interval > 0:
+                contribution_score = self.anchor_contribution_accum.squeeze(dim=1)
+                contribution_eligible = anchors_mask
+            else:
+                contribution_score = self.anchor_contribution_accum.squeeze(dim=1) / torch.clamp(
+                    contribution_views, min=1.0
+                )
+                contribution_eligible = anchors_mask & (contribution_views > 0)
+            for level in range(self.levels):
+                level_pool = contribution_eligible & (self.get_level.squeeze(dim=1) == level)
+                target_count = int((opacity_prune_mask & level_pool).sum().item())
+                if target_count <= 0:
+                    continue
+                pool_indices = torch.nonzero(level_pool, as_tuple=False).flatten()
+                if target_count > pool_indices.numel():
+                    raise RuntimeError(
+                        f"Contribution pruning pool too small at LOD {level}: "
+                        f"target={target_count}, eligible={pool_indices.numel()}"
+                    )
+                pool_scores = contribution_score[pool_indices]
+                selected = torch.argsort(pool_scores, stable=True)[:target_count]
+                prune_mask[pool_indices[selected]] = True
+        else:
+            prune_mask = opacity_prune_mask
         
+        contribution_eligible_count = int((anchors_mask & (self.anchor_contribution_views.squeeze(dim=1) > 0)).sum().item()) if contribution_pruning else 0
+        opacity_candidate_by_lod = [
+            int((opacity_prune_mask & (self._level.squeeze(dim=1) == level)).sum().item())
+            for level in range(self.levels)
+        ]
+        prune_set_intersection = int((opacity_prune_mask & prune_mask).sum().item())
+        prune_set_union = int((opacity_prune_mask | prune_mask).sum().item())
+        if contribution_pruning and self.anchor_contribution_accum.numel():
+            contribution_mean = self.anchor_contribution_accum / torch.clamp(self.anchor_contribution_views, min=1.0)
+            contribution_mean_min = float(contribution_mean.min().item())
+            contribution_mean_max = float(contribution_mean.max().item())
+            contribution_mean_mean = float(contribution_mean.mean().item())
+            score_sum_min = float(self.anchor_contribution_accum.min().item())
+            score_sum_max = float(self.anchor_contribution_accum.max().item())
+            score_sum_mean = float(self.anchor_contribution_accum.mean().item())
+        else:
+            contribution_mean_min = contribution_mean_max = contribution_mean_mean = 0.0
+            score_sum_min = score_sum_max = score_sum_mean = 0.0
+
         # update offset_denom
         offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]
         offset_denom = offset_denom.view([-1, 1])
@@ -891,6 +1045,9 @@ class GaussianModel:
         if anchors_mask.sum()>0:
             self.opacity_accum[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
             self.anchor_demon[anchors_mask] = torch.zeros([anchors_mask.sum(), 1], device='cuda').float()
+            if contribution_pruning and contribution_reset_interval == 0:
+                self.anchor_contribution_accum[anchors_mask] = 0.0
+                self.anchor_contribution_views[anchors_mask] = 0.0
         
         temp_opacity_accum = self.opacity_accum[~prune_mask]
         del self.opacity_accum
@@ -900,8 +1057,30 @@ class GaussianModel:
         del self.anchor_demon
         self.anchor_demon = temp_anchor_demon
 
+        selected_prune_by_lod = [
+            int((prune_mask & (self._level.squeeze(dim=1) == level)).sum().item())
+            for level in range(self.levels)
+        ]
         if prune_mask.shape[0]>0:
             self.prune_anchor(prune_mask)
+        return {
+            "pruning_mode": "anchor_contribution_lod" if contribution_pruning else "raw_opacity",
+            "opacity_candidate_count": int(opacity_prune_mask.sum().item()),
+            "selected_prune_count": int(prune_mask.sum().item()),
+            "anchor_count_before_prune": int(anchors_mask.shape[0]),
+            "anchor_count_after_prune": int(self.get_anchor.shape[0]),
+            "selected_prune_by_lod": selected_prune_by_lod,
+            "contribution_eligible_count": contribution_eligible_count,
+            "opacity_candidate_by_lod": opacity_candidate_by_lod,
+            "prune_set_intersection": prune_set_intersection,
+            "prune_set_union": prune_set_union,
+            "score_sum_min": score_sum_min,
+            "score_sum_max": score_sum_max,
+            "score_sum_mean": score_sum_mean,
+            "contribution_mean_min": contribution_mean_min,
+            "contribution_mean_max": contribution_mean_max,
+            "contribution_mean_mean": contribution_mean_mean,
+        }
 
     def save_mlp_checkpoints(self, path, mode = 'split'):#split or unite
         mkdir_p(os.path.dirname(path))

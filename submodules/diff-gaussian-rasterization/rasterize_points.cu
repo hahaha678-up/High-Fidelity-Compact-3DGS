@@ -32,7 +32,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     return lambda;
 }
 
-std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
 	const torch::Tensor& means3D,
@@ -46,6 +46,8 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor& projmatrix,
 	const float tan_fovx, 
 	const float tan_fovy,
+	const float kernel_size,
+	const torch::Tensor& subpixel_offset,
     const int image_height,
     const int image_width,
 	const torch::Tensor& sh,
@@ -67,6 +69,8 @@ RasterizeGaussiansCUDA(
 
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
+  torch::Tensor important_score = torch::full({P}, 0.0, float_opts);
+  torch::Tensor gaussians_count = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
@@ -106,16 +110,20 @@ RasterizeGaussiansCUDA(
 		campos.contiguous().data<float>(),
 		tan_fovx,
 		tan_fovy,
+		kernel_size,
+		subpixel_offset.contiguous().data<float>(),
 		prefiltered,
 		out_color.contiguous().data<float>(),
-		radii.contiguous().data<int>(),
-		debug);
+	    radii.contiguous().data<int>(),
+	    important_score.contiguous().data<float>(),
+	    gaussians_count.contiguous().data<int>(),
+	    debug);
   }
-  return std::make_tuple(rendered, out_color, radii, geomBuffer, binningBuffer, imgBuffer);
+  return std::make_tuple(rendered, out_color, radii, important_score, gaussians_count, geomBuffer, binningBuffer, imgBuffer);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
-RasterizeGaussiansBackwardCUDA(
+ RasterizeGaussiansBackwardCUDA(
  	const torch::Tensor& background,
 	const torch::Tensor& means3D,
 	const torch::Tensor& radii,
@@ -128,6 +136,8 @@ RasterizeGaussiansBackwardCUDA(
     const torch::Tensor& projmatrix,
 	const float tan_fovx,
 	const float tan_fovy,
+	const float kernel_size,
+	const torch::Tensor& subpixel_offset,
     const torch::Tensor& dL_dout_color,
 	const torch::Tensor& sh,
 	const int degree,
@@ -175,6 +185,8 @@ RasterizeGaussiansBackwardCUDA(
 	  campos.contiguous().data<float>(),
 	  tan_fovx,
 	  tan_fovy,
+	  kernel_size,
+	  subpixel_offset.contiguous().data<float>(),
 	  radii.contiguous().data<int>(),
 	  reinterpret_cast<char*>(geomBuffer.contiguous().data_ptr()),
 	  reinterpret_cast<char*>(binningBuffer.contiguous().data_ptr()),
@@ -195,11 +207,10 @@ RasterizeGaussiansBackwardCUDA(
   return std::make_tuple(dL_dmeans2D, dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations);
 }
 
-torch::Tensor 
-markVisible(
-	torch::Tensor& means3D,
-	torch::Tensor& viewmatrix,
-	torch::Tensor& projmatrix)
+torch::Tensor markVisible(
+		torch::Tensor& means3D,
+		torch::Tensor& viewmatrix,
+		torch::Tensor& projmatrix)
 { 
   const int P = means3D.size(0);
   
@@ -217,7 +228,6 @@ markVisible(
   return present;
 }
 
-
 torch::Tensor
 RasterizeGaussiansfilterCUDA(
 	const torch::Tensor& means3D,
@@ -227,8 +237,9 @@ RasterizeGaussiansfilterCUDA(
 	const torch::Tensor& cov3D_precomp,
 	const torch::Tensor& viewmatrix,
 	const torch::Tensor& projmatrix,
-	const float tan_fovx, 
+	const float tan_fovx,
 	const float tan_fovy,
+	const float kernel_size,
 	const int image_height,
 	const int image_width,
 	const bool prefiltered,
@@ -237,17 +248,12 @@ RasterizeGaussiansfilterCUDA(
   if (means3D.ndimension() != 2 || means3D.size(1) != 3) {
     AT_ERROR("means3D must have dimensions (num_points, 3)");
   }
-  
+
   const int P = means3D.size(0);
   const int H = image_height;
   const int W = image_width;
-
-  auto int_opts = means3D.options().dtype(torch::kInt32);
-  auto float_opts = means3D.options().dtype(torch::kFloat32);
-
-
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
-  
+
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
   torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
@@ -256,31 +262,28 @@ RasterizeGaussiansfilterCUDA(
   std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
-  
 
-  if(P != 0)
+  if (P != 0)
   {
-	  int M = 0;
-
-	  CudaRasterizer::Rasterizer::visible_filter(
-			geomFunc,
-			binningFunc,
-			imgFunc,
-			P, M,
-			W, H,
-			means3D.contiguous().data<float>(),
-			scales.contiguous().data_ptr<float>(),
-			scale_modifier,
-			rotations.contiguous().data_ptr<float>(),
-			cov3D_precomp.contiguous().data<float>(), 
-			viewmatrix.contiguous().data<float>(), 
-			projmatrix.contiguous().data<float>(),
-			tan_fovx,
-			tan_fovy,
-			prefiltered,
-			radii.contiguous().data<int>(),
-			debug
-		);
+    CudaRasterizer::Rasterizer::visible_filter(
+      geomFunc,
+      binningFunc,
+      imgFunc,
+      P, 0,
+      W, H,
+      means3D.contiguous().data<float>(),
+      scales.contiguous().data_ptr<float>(),
+      scale_modifier,
+      rotations.contiguous().data_ptr<float>(),
+      cov3D_precomp.contiguous().data<float>(),
+      viewmatrix.contiguous().data<float>(),
+      projmatrix.contiguous().data<float>(),
+      tan_fovx,
+      tan_fovy,
+      kernel_size,
+      prefiltered,
+      radii.contiguous().data<int>(),
+      debug);
   }
   return radii;
 }

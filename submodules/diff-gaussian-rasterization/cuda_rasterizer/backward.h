@@ -25,6 +25,7 @@ namespace BACKWARD
 		const uint2* ranges,
 		const uint32_t* point_list,
 		int W, int H,
+		const float2* subpixel_offset,
 		const float* bg_color,
 		const float2* means2D,
 		const float4* conic_opacity,
@@ -51,6 +52,7 @@ namespace BACKWARD
 		const float* proj,
 		const float focal_x, float focal_y,
 		const float tan_fovx, float tan_fovy,
+		const float kernel_size,
 		const glm::vec3* campos,
 		const float3* dL_dmean2D,
 		const float* dL_dconics,
@@ -59,7 +61,9 @@ namespace BACKWARD
 		float* dL_dcov3D,
 		float* dL_dsh,
 		glm::vec3* dL_dscale,
-		glm::vec4* dL_drot);
+		glm::vec4* dL_drot,
+		const float4* conic_opacity,
+		float* dL_dopacity);
 }
 
 #endif

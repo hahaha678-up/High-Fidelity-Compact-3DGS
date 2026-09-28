@@ -47,11 +47,14 @@ namespace CudaRasterizer
 			const float* projmatrix,
 			const float* cam_pos,
 			const float tan_fovx, float tan_fovy,
+			const float kernel_size,
+			const float* subpixel_offset,
 			const bool prefiltered,
 			float* out_color,
 			int* radii = nullptr,
+			float* important_score = nullptr,
+			int* gaussians_count = nullptr,
 			bool debug = false);
-
 
 		static void visible_filter(
 			std::function<char* (size_t)> geometryBuffer,
@@ -67,12 +70,11 @@ namespace CudaRasterizer
 			const float* viewmatrix,
 			const float* projmatrix,
 			const float tan_fovx, float tan_fovy,
+			const float kernel_size,
 			const bool prefiltered,
 			int* radii,
 			bool debug);
-		
-		
-		
+
 		static void backward(
 			const int P, int D, int M, int R,
 			const float* background,
@@ -88,6 +90,8 @@ namespace CudaRasterizer
 			const float* projmatrix,
 			const float* campos,
 			const float tan_fovx, float tan_fovy,
+			const float kernel_size,
+			const float* subpixel_offset,
 			const int* radii,
 			char* geom_buffer,
 			char* binning_buffer,

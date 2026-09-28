@@ -37,6 +37,7 @@ namespace FORWARD
 		const int W, int H,
 		const float focal_x, float focal_y,
 		const float tan_fovx, float tan_fovy,
+		const float kernel_size,
 		int* radii,
 		float2* points_xy_image,
 		float* depths,
@@ -47,19 +48,6 @@ namespace FORWARD
 		uint32_t* tiles_touched,
 		bool prefiltered);
 
-	// Main rasterization method.
-	void render(
-		const dim3 grid, dim3 block,
-		const uint2* ranges,
-		const uint32_t* point_list,
-		int W, int H,
-		const float2* points_xy_image,
-		const float* features,
-		const float4* conic_opacity,
-		float* final_T,
-		uint32_t* n_contrib,
-		const float* bg_color,
-		float* out_color);
 	void filter_preprocess(int P, int M,
 		const float* means3D,
 		const glm::vec3* scales,
@@ -71,10 +59,28 @@ namespace FORWARD
 		const int W, int H,
 		const float focal_x, float focal_y,
 		const float tan_fovx, float tan_fovy,
+		const float kernel_size,
 		int* radii,
 		float* cov3Ds,
 		const dim3 grid,
 		bool prefiltered);
+
+	// Main rasterization method.
+	void render(
+		const dim3 grid, dim3 block,
+		const uint2* ranges,
+		const uint32_t* point_list,
+		int W, int H,
+		const float2* subpixel_offset,
+		const float2* points_xy_image,
+		const float* features,
+		const float4* conic_opacity,
+		float* final_T,
+		uint32_t* n_contrib,
+		const float* bg_color,
+		float* out_color,
+		float* important_score,
+		int* gaussians_count);
 }
 
 

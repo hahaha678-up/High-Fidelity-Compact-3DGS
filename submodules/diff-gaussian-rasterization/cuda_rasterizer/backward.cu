@@ -147,10 +147,13 @@ __global__ void computeCov2DCUDA(int P,
 	const float* cov3Ds,
 	const float h_x, float h_y,
 	const float tan_fovx, float tan_fovy,
+	const float kernel_size,
 	const float* view_matrix,
 	const float* dL_dconics,
 	float3* dL_dmeans,
-	float* dL_dcov)
+	float* dL_dcov,
+	const float4* __restrict__ conic_opacity,
+	float* dL_dopacity)
 {
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P || !(radii[idx] > 0))
@@ -163,8 +166,10 @@ __global__ void computeCov2DCUDA(int P,
 	// intermediate forward results needed in the backward.
 	float3 mean = means[idx];
 	float3 dL_dconic = { dL_dconics[4 * idx], dL_dconics[4 * idx + 1], dL_dconics[4 * idx + 3] };
+	const float4 conic = conic_opacity[idx];
+	const float combined_opacity = conic.w;
 	float3 t = transformPoint4x3(mean, view_matrix);
-	
+
 	const float limx = 1.3f * tan_fovx;
 	const float limy = 1.3f * tan_fovy;
 	const float txtz = t.x / t.z;
@@ -193,10 +198,29 @@ __global__ void computeCov2DCUDA(int P,
 
 	glm::mat3 cov2D = glm::transpose(T) * glm::transpose(Vrk) * T;
 
+	const float det_0 = max(1e-6, cov2D[0][0] * cov2D[1][1] - cov2D[0][1] * cov2D[0][1]);
+	const float det_1 = max(1e-6, (cov2D[0][0] + kernel_size) * (cov2D[1][1] + kernel_size) - cov2D[0][1] * cov2D[0][1]);
+	// sqrt here
+	const float coef = sqrt(det_0 / (det_1+1e-6) + 1e-6);
+
+	// update the gradient of alpha and save the gradient of dalpha_dcoef
+	// we need opacity as input
+	// new_opacity = coef * opacity
+	// if we know the new opacity, we can derive original opacity and then dalpha_dcoef = dopacity * opacity
+	const float opacity = combined_opacity / (coef + 1e-6);
+	const float dL_dcoef = dL_dopacity[idx] * opacity;
+	const float dL_dsqrtcoef = dL_dcoef * 0.5 * 1. / (coef + 1e-6);
+	const float dL_ddet0 = dL_dsqrtcoef / (det_1+1e-6);
+	const float dL_ddet1 = dL_dsqrtcoef * det_0 * (-1.f / (det_1 * det_1 + 1e-6));
+	//TODO gradient is zero if det_0 or det_1 < 0
+	const float dcoef_da = dL_ddet0 * cov2D[1][1] + dL_ddet1 * (cov2D[1][1] + kernel_size);
+	const float dcoef_db = dL_ddet0 * (-2. * cov2D[0][1]) + dL_ddet1 * (-2. * cov2D[0][1]);
+	const float dcoef_dc = dL_ddet0 * cov2D[0][0] + dL_ddet1 * (cov2D[0][0] + kernel_size);
+
 	// Use helper variables for 2D covariance entries. More compact.
-	float a = cov2D[0][0] += 0.3f;
+	float a = cov2D[0][0] += kernel_size;
 	float b = cov2D[0][1];
-	float c = cov2D[1][1] += 0.3f;
+	float c = cov2D[1][1] += kernel_size;
 
 	float denom = a * c - b * b;
 	float dL_da = 0, dL_db = 0, dL_dc = 0;
@@ -210,6 +234,18 @@ __global__ void computeCov2DCUDA(int P,
 		dL_da = denom2inv * (-c * c * dL_dconic.x + 2 * b * c * dL_dconic.y + (denom - a * c) * dL_dconic.z);
 		dL_dc = denom2inv * (-a * a * dL_dconic.z + 2 * a * b * dL_dconic.y + (denom - a * c) * dL_dconic.x);
 		dL_db = denom2inv * 2 * (b * c * dL_dconic.x - (denom + 2 * b * b) * dL_dconic.y + a * b * dL_dconic.z);
+
+		if (det_0 <= 1e-6 || det_1 <= 1e-6){
+			dL_dopacity[idx] = 0;
+		} else {
+			// Gradiends of alpha respect to conv due to low pass filter
+			dL_da += dcoef_da;
+			dL_dc += dcoef_dc;
+			dL_db += dcoef_db;
+
+			// update dL_dopacity
+			dL_dopacity[idx] = dL_dopacity[idx] * coef;
+		}
 
 		// Gradients of loss L w.r.t. each 3D covariance matrix (Vrk) entry, 
 		// given gradients w.r.t. 2D covariance matrix (diagonal).
@@ -402,6 +438,7 @@ renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
+	const float2* __restrict__ subpixel_offset,
 	const float* __restrict__ bg_color,
 	const float2* __restrict__ points_xy_image,
 	const float4* __restrict__ conic_opacity,
@@ -421,7 +458,7 @@ renderCUDA(
 	const uint2 pix_max = { min(pix_min.x + BLOCK_X, W), min(pix_min.y + BLOCK_Y , H) };
 	const uint2 pix = { pix_min.x + block.thread_index().x, pix_min.y + block.thread_index().y };
 	const uint32_t pix_id = W * pix.y + pix.x;
-	const float2 pixf = { (float)pix.x, (float)pix.y };
+	float2 pixf = { (float)pix.x, (float)pix.y };
 
 	const bool inside = pix.x < W&& pix.y < H;
 	const uint2 range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
@@ -430,6 +467,14 @@ renderCUDA(
 
 	bool done = !inside;
 	int toDo = range.y - range.x;
+
+	if (inside){
+		pixf.x += subpixel_offset[pix_id].x;
+		pixf.y += subpixel_offset[pix_id].y;
+		// if (pix_id == 0){
+		// 	printf("\n\n in backward rendering, pixf is %.5f %.5f  offset %.5f %.5f\n\n", pixf.x, pixf.y, subpixel_offset[pix_id].x, subpixel_offset[pix_id].y);
+		// }
+	}
 
 	__shared__ int collected_id[BLOCK_SIZE];
 	__shared__ float2 collected_xy[BLOCK_SIZE];
@@ -570,6 +615,7 @@ void BACKWARD::preprocess(
 	const float* projmatrix,
 	const float focal_x, float focal_y,
 	const float tan_fovx, float tan_fovy,
+	const float kernel_size,
 	const glm::vec3* campos,
 	const float3* dL_dmean2D,
 	const float* dL_dconic,
@@ -578,7 +624,9 @@ void BACKWARD::preprocess(
 	float* dL_dcov3D,
 	float* dL_dsh,
 	glm::vec3* dL_dscale,
-	glm::vec4* dL_drot)
+	glm::vec4* dL_drot,
+	const float4* conic_opacity,
+	float* dL_dopacity)
 {
 	// Propagate gradients for the path of 2D conic matrix computation. 
 	// Somewhat long, thus it is its own kernel rather than being part of 
@@ -593,10 +641,13 @@ void BACKWARD::preprocess(
 		focal_y,
 		tan_fovx,
 		tan_fovy,
+		kernel_size,
 		viewmatrix,
 		dL_dconic,
 		(float3*)dL_dmean3D,
-		dL_dcov3D);
+		dL_dcov3D,
+		conic_opacity,
+		dL_dopacity);
 
 	// Propagate gradients for remaining steps: finish 3D mean gradients,
 	// propagate color gradients to SH (if desireD), propagate 3D covariance
@@ -626,6 +677,7 @@ void BACKWARD::render(
 	const uint2* ranges,
 	const uint32_t* point_list,
 	int W, int H,
+	const float2* subpixel_offset,
 	const float* bg_color,
 	const float2* means2D,
 	const float4* conic_opacity,
@@ -642,6 +694,7 @@ void BACKWARD::render(
 		ranges,
 		point_list,
 		W, H,
+		subpixel_offset,
 		bg_color,
 		means2D,
 		conic_opacity,
